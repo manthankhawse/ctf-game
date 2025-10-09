@@ -1,4 +1,4 @@
-// client.cpp
+// client_realtime.cpp
 #include <iostream>
 #include <string>
 #include <thread>
@@ -6,45 +6,45 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <ncurses.h> // The key library for TUI and real-time input
+#include <mutex>
 
 #include "game_common.h"
 
 // ==========================================================
-// 2b. Client Module: Game Renderer
+// 2b. Client Module: Game Renderer (Now with ncurses)
 // ==========================================================
-void clearScreen() {
-    // A simple cross-platform way to clear the console
-    #ifdef _WIN32
-        system("cls");
-    #else
-        system("clear");
-    #endif
-}
 
-void renderGame(const std::string& serialized_map) {
-    clearScreen();
-    std::cout << "--- Capture The Flag ---" << std::endl;
-    std::cout << "Use W, A, S, D to move. Capture the enemy flag and return it to your base!" << std::endl;
-    std::cout << "Player 1 is '1', Flag is 'A', Base is 'a'. Player 2 is '2', Flag is 'B', Base is 'b'." << std::endl;
-    std::cout << "'!' means P1 has the flag. '@' means P2 has the flag." << std::endl;
-    std::cout << "------------------------" << std::endl;
+// Shared buffer for the receiver thread to write to and the main thread to render from
+std::string latestGameState;
+std::mutex stateMutex;
+
+void renderGame() {
+    std::lock_guard<std::mutex> lock(stateMutex);
     
-    // De-serialize the map part
+    clear(); // ncurses clear screen function
+
+    // Print static instructions
+    mvprintw(0, 0, "--- Capture The Flag (Real-Time) ---");
+    mvprintw(1, 0, "Use ARROW KEYS or W, A, S, D to move. Quit with 'q'.");
+    mvprintw(2, 0, "--------------------------------------------------");
+
+    // De-serialize and print the map
     int map_char_count = GRID_HEIGHT * GRID_WIDTH;
-    if(serialized_map.length() >= map_char_count) {
+    if(latestGameState.length() >= map_char_count) {
         for (int i = 0; i < GRID_HEIGHT; ++i) {
-            std::cout << serialized_map.substr(i * GRID_WIDTH, GRID_WIDTH) << std::endl;
+            std::string row = latestGameState.substr(i * GRID_WIDTH, GRID_WIDTH);
+            mvprintw(i + 4, 0, row.c_str());
         }
-        // Print the rest of the message (scores, etc.)
-        std::cout << serialized_map.substr(map_char_count) << std::endl;
+        // Print the rest of the message (scores, etc.) below the map
+        std::string extra_info = latestGameState.substr(map_char_count);
+        mvprintw(GRID_HEIGHT + 5, 0, extra_info.c_str());
     } else {
-        // Fallback for incomplete data
-        std::cout << "Waiting for game state..." << std::endl;
+        mvprintw(4, 0, "Waiting for game state...");
     }
 
-    std::cout << "Your move (w/a/s/d): " << std::flush;
+    refresh(); // ncurses function to draw the screen
 }
-
 
 // ==========================================================
 // 2b. Client Module: Receiver Thread
@@ -55,8 +55,11 @@ void receiveFromServer(int sock) {
         memset(buffer, 0, BUFFER_SIZE);
         int bytes_received = read(sock, buffer, BUFFER_SIZE - 1);
         if (bytes_received > 0) {
-            renderGame(std::string(buffer));
+            std::lock_guard<std::mutex> lock(stateMutex);
+            latestGameState = std::string(buffer);
         } else {
+            // Server disconnected
+            endwin(); // Clean up ncurses
             std::cout << "\nDisconnected from server. Game over." << std::endl;
             close(sock);
             exit(0);
@@ -64,55 +67,98 @@ void receiveFromServer(int sock) {
     }
 }
 
+// ==========================================================
+// 2b. Client Module: Input Handler (Now non-blocking)
+// ==========================================================
+void inputHandler(int sock) {
+    while (true) {
+        int ch = getch(); // This is the NON-BLOCKING input call from ncurses
+
+        if (ch != ERR) { // ERR means no key was pressed
+            std::string command = "";
+            switch(ch) {
+                case KEY_UP:
+                case 'w':
+                    command = "w";
+                    break;
+                case KEY_DOWN:
+                case 's':
+                    command = "s";
+                    break;
+                case KEY_LEFT:
+                case 'a':
+                    command = "a";
+                    break;
+                case KEY_RIGHT:
+                case 'd':
+                    command = "d";
+                    break;
+                case 'q':
+                    endwin(); // Important: Restore terminal settings
+                    close(sock);
+                    exit(0);
+            }
+            if (!command.empty()) {
+                send(sock, command.c_str(), command.length(), 0);
+            }
+        }
+        // Small delay to prevent the loop from consuming 100% CPU
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+
 int main(int argc, char const *argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <Server IP Address>" << std::endl;
         return -1;
     }
-    const char* server_ip = argv[1];
-
-    int sock = 0;
-    struct sockaddr_in serv_addr;
-
+    
     // ==========================================================
     // 2b. Client Module: Connection Interface
     // ==========================================================
+    int sock = 0;
+    struct sockaddr_in serv_addr;
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        std::cout << "\n Socket creation error \n";
+        perror("Socket creation error");
         return -1;
     }
-
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(PORT);
-
-    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        std::cout << "\nInvalid address/ Address not supported \n";
+    if (inet_pton(AF_INET, argv[1], &serv_addr.sin_addr) <= 0) {
+        perror("Invalid address");
         return -1;
     }
-
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::cout << "\nConnection Failed \n";
+        perror("Connection Failed");
         return -1;
     }
-    std::cout << "Connected to the game server. Waiting for the game to start..." << std::endl;
 
-    // Start a separate thread to receive and render game state updates
+    // --- Initialize ncurses ---
+    initscr();              // Start ncurses mode
+    cbreak();               // Line buffering disabled, Pass on everthing
+    noecho();               // Don't echo() while we do getch
+    keypad(stdscr, TRUE);   // Enable function keys like arrow keys
+    nodelay(stdscr, TRUE);  // Make getch() non-blocking
+    curs_set(0);            // Hide the cursor
+    // ---
+
+    // Start receiver thread
     std::thread receiver_thread(receiveFromServer, sock);
     receiver_thread.detach();
-    
-    // ==========================================================
-    // 2b. Client Module: Input Handler
-    // ==========================================================
-    std::string input;
+
+    // Start input handler thread
+    std::thread input_thread(inputHandler, sock);
+    input_thread.detach();
+
+    // Main thread is now the rendering loop
     while (true) {
-        std::cin >> input;
-        if (input == "w" || input == "a" || input == "s" || input == "d") {
-            send(sock, input.c_str(), input.length(), 0);
-        } else {
-            std::cout << "Invalid command. Use w, a, s, d." << std::endl;
-        }
+        renderGame();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Redraw at ~20 FPS
     }
 
+    // Cleanup
+    endwin();
     close(sock);
     return 0;
 }
