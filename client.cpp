@@ -1,4 +1,3 @@
-// client_realtime.cpp
 #include <iostream>
 #include <string>
 #include <thread>
@@ -6,14 +5,10 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <ncurses.h> // The key library for TUI and real-time input
+#include <ncurses.h>
 #include <mutex>
 
 #include "game_common.h"
-
-// ==========================================================
-// 2b. Client Module: Game Renderer (Now with ncurses)
-// ==========================================================
 
 // Shared buffer for the receiver thread to write to and the main thread to render from
 std::string latestGameState;
@@ -34,11 +29,13 @@ void renderGame() {
     if(latestGameState.length() >= map_char_count) {
         for (int i = 0; i < GRID_HEIGHT; ++i) {
             std::string row = latestGameState.substr(i * GRID_WIDTH, GRID_WIDTH);
-            mvprintw(i + 4, 0, row.c_str());
+            // CORRECTED: Use "%s" to safely print the string
+            mvprintw(i + 4, 0, "%s", row.c_str());
         }
         // Print the rest of the message (scores, etc.) below the map
         std::string extra_info = latestGameState.substr(map_char_count);
-        mvprintw(GRID_HEIGHT + 5, 0, extra_info.c_str());
+        // CORRECTED: Use "%s" to safely print the string
+        mvprintw(GRID_HEIGHT + 5, 0, "%s", extra_info.c_str());
     } else {
         mvprintw(4, 0, "Waiting for game state...");
     }
@@ -46,9 +43,6 @@ void renderGame() {
     refresh(); // ncurses function to draw the screen
 }
 
-// ==========================================================
-// 2b. Client Module: Receiver Thread
-// ==========================================================
 void receiveFromServer(int sock) {
     char buffer[BUFFER_SIZE] = {0};
     while (true) {
@@ -67,9 +61,6 @@ void receiveFromServer(int sock) {
     }
 }
 
-// ==========================================================
-// 2b. Client Module: Input Handler (Now non-blocking)
-// ==========================================================
 void inputHandler(int sock) {
     while (true) {
         int ch = getch(); // This is the NON-BLOCKING input call from ncurses
@@ -114,9 +105,6 @@ int main(int argc, char const *argv[]) {
         return -1;
     }
     
-    // ==========================================================
-    // 2b. Client Module: Connection Interface
-    // ==========================================================
     int sock = 0;
     struct sockaddr_in serv_addr;
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -135,12 +123,12 @@ int main(int argc, char const *argv[]) {
     }
 
     // --- Initialize ncurses ---
-    initscr();              // Start ncurses mode
-    cbreak();               // Line buffering disabled, Pass on everthing
-    noecho();               // Don't echo() while we do getch
-    keypad(stdscr, TRUE);   // Enable function keys like arrow keys
-    nodelay(stdscr, TRUE);  // Make getch() non-blocking
-    curs_set(0);            // Hide the cursor
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
     // ---
 
     // Start receiver thread

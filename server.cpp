@@ -1,4 +1,3 @@
-// server.cpp
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,9 +12,6 @@
 
 #include "game_common.h"
 
-// ==========================================================
-// 2a. Server Module: Game State Manager & Sync Controller
-// ==========================================================
 struct Player {
     int id;
     int x, y;
@@ -38,9 +34,10 @@ struct GameState {
 GameState sharedGameState;
 std::mutex gameStateMutex;
 
-// ==========================================================
-// 2a. Server Module: Broadcast Manager
-// ==========================================================
+// NEW: A queue to hold the latest command from each player for the game loop
+std::map<int, std::string> commandQueue;
+std::mutex commandMutex;
+
 void broadcastGameState() {
     std::lock_guard<std::mutex> lock(gameStateMutex);
     std::string serialized_map;
@@ -51,21 +48,19 @@ void broadcastGameState() {
     // Add score info to the payload
     int p1_score = sharedGameState.players.count(0) ? sharedGameState.players[0].score : 0;
     int p2_score = sharedGameState.players.count(1) ? sharedGameState.players[1].score : 0;
-    std::string score_info = "\n\nPlayer 1 Score: " + std::to_string(p1_score) + " | Player 2 Score: " + std::to_string(p2_score);
+    
+    // CORRECTED: Removed the "\n\n" to prevent rendering bugs on the client
+    std::string score_info = "Player 1 Score: " + std::to_string(p1_score) + " | Player 2 Score: " + std::to_string(p2_score);
     if (p1_score >= 3) score_info += "\nPLAYER 1 WINS!";
     if (p2_score >= 3) score_info += "\nPLAYER 2 WINS!";
     
     serialized_map += score_info;
-
 
     for (auto const& [id, player] : sharedGameState.players) {
         send(player.sock_fd, serialized_map.c_str(), serialized_map.length(), 0);
     }
 }
 
-// ==========================================================
-// 2a. Server Module: Command Handler
-// ==========================================================
 void handleCommand(int player_id, const std::string& command) {
     std::lock_guard<std::mutex> lock(gameStateMutex);
 
@@ -81,27 +76,20 @@ void handleCommand(int player_id, const std::string& command) {
     else if (command == "d") new_x++;
     else return; // Invalid command
 
-    // Game Rule Validation: Check boundaries and walls
     if (new_x > 0 && new_x < GRID_WIDTH - 1 && new_y > 0 && new_y < GRID_HEIGHT - 1 &&
         sharedGameState.map[new_y][new_x] != WALL_TILE) {
 
-        // Erase old position
         sharedGameState.map[player.y][player.x] = EMPTY_TILE;
-
-        // Update player position
         player.x = new_x;
         player.y = new_y;
 
-        // Game Rule Validation: Flag interaction
         if (sharedGameState.map[player.y][player.x] == player.enemy_flag_tile) {
             player.hasFlag = true;
         }
 
-        // Game Rule Validation: Score condition
         if (player.hasFlag && sharedGameState.map[player.y][player.x] == player.base_tile) {
             player.score++;
             player.hasFlag = false;
-            // Reset enemy flag to its original position
             if (player.id == 0) {
                  sharedGameState.map[sharedGameState.p2_flag_y][sharedGameState.p2_flag_x] = P2_FLAG_TILE;
             } else {
@@ -109,30 +97,53 @@ void handleCommand(int player_id, const std::string& command) {
             }
         }
 
-        // Update map with new player position
         char display_tile = player.hasFlag ? (player.id == 0 ? P1_WITH_FLAG_TILE : P2_WITH_FLAG_TILE) : player.tile;
         sharedGameState.map[player.y][player.x] = display_tile;
     }
 }
 
+// NEW: The main game loop that runs on its own thread
+void gameLoop() {
+    const int TICK_RATE = 15; // Game updates 15 times per second
+    const auto tick_period = std::chrono::milliseconds(1000 / TICK_RATE);
 
+    while (true) {
+        // Process all queued commands
+        {
+            std::lock_guard<std::mutex> lock(commandMutex);
+            if (!commandQueue.empty()) {
+                for (auto const& [player_id, command] : commandQueue) {
+                    handleCommand(player_id, command);
+                }
+                commandQueue.clear();
+            }
+        }
+
+        // Broadcast the result of the tick
+        broadcastGameState();
+
+        // Wait for the next tick
+        std::this_thread::sleep_for(tick_period);
+    }
+}
+
+// MODIFIED: Client handler now just queues commands
 void clientHandler(int client_socket, int player_id) {
     std::cout << "Player " << player_id + 1 << " connected." << std::endl;
 
-    // Initialize player state
     {
         std::lock_guard<std::mutex> lock(gameStateMutex);
         Player newPlayer;
         newPlayer.id = player_id;
         newPlayer.sock_fd = client_socket;
         
-        if (player_id == 0) { // Player 1
+        if (player_id == 0) {
             newPlayer.x = 2;
             newPlayer.y = GRID_HEIGHT / 2 - 2;
             newPlayer.tile = P1_TILE;
             newPlayer.base_tile = P1_BASE_TILE;
             newPlayer.enemy_flag_tile = P2_FLAG_TILE;
-        } else { // Player 2
+        } else {
             newPlayer.x = GRID_WIDTH - 3;
             newPlayer.y = GRID_HEIGHT / 2 + 2;
             newPlayer.tile = P2_TILE;
@@ -143,47 +154,45 @@ void clientHandler(int client_socket, int player_id) {
         sharedGameState.players[player_id] = newPlayer;
         sharedGameState.map[newPlayer.y][newPlayer.x] = newPlayer.tile;
     }
-
-    broadcastGameState();
+    broadcastGameState(); // Initial broadcast to show player
 
     char buffer[BUFFER_SIZE] = {0};
     while (read(client_socket, buffer, BUFFER_SIZE) > 0) {
-        handleCommand(player_id, std::string(buffer));
-        broadcastGameState();
+        // Instead of processing, just add the command to the queue
+        {
+            std::lock_guard<std::mutex> lock(commandMutex);
+            if (strlen(buffer) > 0) {
+                commandQueue[player_id] = std::string(1, buffer[0]);
+            }
+        }
         memset(buffer, 0, BUFFER_SIZE);
     }
     
-    // Cleanup on disconnect
     std::cout << "Player " << player_id + 1 << " disconnected." << std::endl;
     {
         std::lock_guard<std::mutex> lock(gameStateMutex);
         Player& p = sharedGameState.players[player_id];
-        sharedGameState.map[p.y][p.x] = EMPTY_TILE; // Remove player from map
+        sharedGameState.map[p.y][p.x] = EMPTY_TILE;
         sharedGameState.players.erase(player_id);
     }
     broadcastGameState();
     close(client_socket);
 }
 
-
+// MODIFIED: Main function now starts and joins the game loop thread
 int main() {
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
-    int addrlen = sizeof(address);
+    socklen_t addrlen = sizeof(address);
 
-    // ==========================================================
-    // 2a. Server Module: Connection Manager
-    // ==========================================================
     std::cout << "Starting server..." << std::endl;
     
-    // Create socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
-    // Forcefully attaching socket to the port 8080
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
@@ -192,46 +201,42 @@ int main() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
-    // Bind socket to the network address and port
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
 
-    // Listen for incoming connections
-    if (listen(server_fd, 2) < 0) { // Listen for a max of 2 players
+    if (listen(server_fd, 2) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
     }
     
-    // Initialize the game state
     sharedGameState.map = createInitialMap();
     sharedGameState.p1_flag_y = GRID_HEIGHT / 2;
     sharedGameState.p1_flag_x = 3;
     sharedGameState.p2_flag_y = GRID_HEIGHT / 2;
     sharedGameState.p2_flag_x = GRID_WIDTH - 4;
 
-
     std::cout << "Server is listening on port " << PORT << std::endl;
-    int player_count = 0;
 
-    while (player_count < 2) { // Game is for 2 players
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+    // Start the main game loop on a separate thread
+    std::thread game_thread(gameLoop);
+
+    int player_count = 0;
+    while (player_count < 2) {
+        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen)) < 0) {
             perror("accept");
             continue;
         }
         
-        // Spawn a new thread for each client
         std::thread client_thread(clientHandler, new_socket, player_count);
-        client_thread.detach(); // Detach the thread to run independently
+        client_thread.detach();
         player_count++;
     }
 
-    // Server will just keep running while client threads handle the game
-    // A more robust server might have a command to shut down gracefully
-    while(true) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-    }
+    // Keep the main thread alive by joining the game loop thread
+    game_thread.join();
 
+    close(server_fd);
     return 0;
 }
