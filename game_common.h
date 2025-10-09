@@ -1,4 +1,3 @@
-// game_common.h
 #ifndef GAME_COMMON_H
 #define GAME_COMMON_H
 
@@ -27,7 +26,7 @@ const char P2_WITH_FLAG_TILE = '@';
 
 
 // Helper function to create the initial game map
-std::vector<std::string> createInitialMap() {
+inline std::vector<std::string> createInitialMap() {
     std::vector<std::string> map(GRID_HEIGHT, std::string(GRID_WIDTH, EMPTY_TILE));
 
     // Create a border
